@@ -1,0 +1,309 @@
+diff --git a/camera/device/1.0/default/CameraDevice.cpp b/camera/device/1.0/default/CameraDevice.cpp
+index cbea3f0599..32feba0724 100644
+--- a/camera/device/1.0/default/CameraDevice.cpp
++++ b/camera/device/1.0/default/CameraDevice.cpp
+@@ -20,6 +20,7 @@
+ #include <hidlmemory/mapping.h>
+ #include <log/log.h>
+ #include <utils/Trace.h>
++#include <cutils/properties.h>
+ 
+ #include <media/hardware/HardwareAPI.h> // For VideoNativeHandleMetadata
+ #include "CameraDevice_1_0.h"
+@@ -35,6 +36,7 @@ using ::android::hardware::graphics::common::V1_0::BufferUsage;
+ using ::android::hardware::graphics::common::V1_0::PixelFormat;
+ 
+ HandleImporter CameraDevice::sHandleImporter;
++CameraDevice* CameraDevice::sCameraInstance = nullptr;
+ 
+ Status CameraDevice::getHidlStatus(const int& status) {
+     switch (status) {
+@@ -361,7 +363,10 @@ CameraDevice::CameraHeapMemory::~CameraHeapMemory() {
+ // shared memory methods
+ camera_memory_t* CameraDevice::sGetMemory(int fd, size_t buf_size, uint_t num_bufs, void *user) {
+     ALOGV("%s", __FUNCTION__);
+-    CameraDevice* object = static_cast<CameraDevice*>(user);
++    // N-era MTK HAL ABI: user may be NULL (see sCameraInstance declaration in header).
++    CameraDevice* object = (user != nullptr)
++            ? static_cast<CameraDevice*>(user)
++            : sCameraInstance;
+     if (object->mDeviceCallback == nullptr) {
+         ALOGE("%s: camera HAL request memory while camera is not opened!", __FUNCTION__);
+         return nullptr;
+@@ -414,17 +419,124 @@ void CameraDevice::sPutMemory(camera_memory_t *data) {
+ // Callback forwarding methods
+ void CameraDevice::sNotifyCb(int32_t msg_type, int32_t ext1, int32_t ext2, void *user) {
+     ALOGV("%s", __FUNCTION__);
+-    CameraDevice* object = static_cast<CameraDevice*>(user);
++    // N-era MTK HAL ABI: user may be NULL (see sCameraInstance declaration in header).
++    CameraDevice* object = (user != nullptr)
++            ? static_cast<CameraDevice*>(user)
++            : sCameraInstance;
+     if (object->mDeviceCallback != nullptr) {
+         object->mDeviceCallback->notifyCallback((NotifyCallbackMsg) msg_type, ext1, ext2);
+     }
+ }
+ 
++// Set the EXIF Orientation tag in a JPEG byte stream in-place.
++// Returns true if the tag was found and written. The EXIF SHORT-typed value
++// is updated in the IFD0 entry's inline value field (no offset to follow).
++// Walks JPEG markers from SOI; stops at SOS or first non-FF byte.
++//
++// orientation values (TIFF spec):
++//   1 = top-left (default, no rotation)
++//   3 = bottom-right (180 deg rotation)
++//   6 = right-top  (90 deg CW)
++//   8 = left-bottom (270 deg CW = 90 deg CCW)
++static bool patchJpegExifOrientation(void* jpegData, size_t size, uint16_t newOrientation) {
++    if (jpegData == nullptr || size < 30) return false;
++    uint8_t* p = static_cast<uint8_t*>(jpegData);
++    if (p[0] != 0xFF || p[1] != 0xD8) return false;  // SOI
++
++    size_t i = 2;
++    while (i + 4 < size && p[i] == 0xFF) {
++        if (p[i + 1] == 0xFF) { i++; continue; }
++        if (p[i + 1] == 0xDA) return false;  // SOS reached without EXIF
++        uint16_t segLen = (static_cast<uint16_t>(p[i + 2]) << 8) | p[i + 3];
++        if (segLen < 2 || i + 2 + segLen > size) return false;
++
++        if (p[i + 1] == 0xE1 && i + 10 < size &&
++                p[i + 4] == 'E' && p[i + 5] == 'x' && p[i + 6] == 'i' && p[i + 7] == 'f' &&
++                p[i + 8] == 0 && p[i + 9] == 0) {
++            size_t tiffOff = i + 10;
++            if (tiffOff + 8 > size) return false;
++            bool littleEndian = (p[tiffOff] == 'I' && p[tiffOff + 1] == 'I');
++            bool bigEndian = (p[tiffOff] == 'M' && p[tiffOff + 1] == 'M');
++            if (!littleEndian && !bigEndian) return false;
++
++            auto rd16 = [&](size_t off) -> uint16_t {
++                return littleEndian
++                        ? static_cast<uint16_t>(p[off] | (p[off + 1] << 8))
++                        : static_cast<uint16_t>((p[off] << 8) | p[off + 1]);
++            };
++            auto rd32 = [&](size_t off) -> uint32_t {
++                return littleEndian
++                        ? (uint32_t(p[off]) | (uint32_t(p[off + 1]) << 8)
++                                | (uint32_t(p[off + 2]) << 16) | (uint32_t(p[off + 3]) << 24))
++                        : ((uint32_t(p[off]) << 24) | (uint32_t(p[off + 1]) << 16)
++                                | (uint32_t(p[off + 2]) << 8) | uint32_t(p[off + 3]));
++            };
++
++            uint16_t magic = rd16(tiffOff + 2);
++            if (magic != 42) return false;
++            uint32_t ifd0Off = rd32(tiffOff + 4);
++            size_t ifd0 = tiffOff + ifd0Off;
++            if (ifd0 + 2 > size) return false;
++            uint16_t nEntries = rd16(ifd0);
++            for (uint16_t e = 0; e < nEntries; e++) {
++                size_t entOff = ifd0 + 2 + e * 12;
++                if (entOff + 12 > size) return false;
++                uint16_t tag = rd16(entOff);
++                if (tag == 0x0112) {  // Orientation
++                    uint16_t typ = rd16(entOff + 2);
++                    if (typ != 3) return false;  // expect SHORT
++                    if (littleEndian) {
++                        p[entOff + 8] = static_cast<uint8_t>(newOrientation & 0xFF);
++                        p[entOff + 9] = static_cast<uint8_t>((newOrientation >> 8) & 0xFF);
++                    } else {
++                        p[entOff + 8] = static_cast<uint8_t>((newOrientation >> 8) & 0xFF);
++                        p[entOff + 9] = static_cast<uint8_t>(newOrientation & 0xFF);
++                    }
++                    return true;
++                }
++            }
++            return false;
++        }
++        i += 2 + segLen;
++    }
++    return false;
++}
++
+ void CameraDevice::sDataCb(int32_t msg_type, const camera_memory_t *data, unsigned int index,
+         camera_frame_metadata_t *metadata, void *user) {
+     ALOGV("%s", __FUNCTION__);
+-    CameraDevice* object = static_cast<CameraDevice*>(user);
++    // N-era MTK HAL ABI: user may be NULL (see sCameraInstance declaration in header).
++    CameraDevice* object = (user != nullptr)
++            ? static_cast<CameraDevice*>(user)
++            : sCameraInstance;
+     sp<CameraHeapMemory> mem(static_cast<CameraHeapMemory*>(data->handle));
++
++    // checkers OV9734 + SF primary_display_orientation=ORIENTATION_90 cause the JPEG
++    // bytes emitted by the vendor blob (libcam.camshot.so / JpgEncHal) to be rotated
++    // 180 deg from device-natural. The vendor HAL ignores Camera.Parameters("rotation")
++    // and emits EXIF Orientation=1 regardless. Patch the EXIF tag here so any consumer
++    // of ICameraDevice@1.0 (Camera2 LEGACY shim, Camera1 apps, etc.) gets a JPEG that
++    // EXIF-aware viewers display upright.
++    //
++    // Sysprop persist.camera.hal.exif_orientation accepts {1,3,6,8} (raw EXIF tag values)
++    // for empirical bisection; default 0 = no patch.
++    if (msg_type == CAMERA_MSG_COMPRESSED_IMAGE && mem->mHidlHeapMemData != nullptr) {
++        char propVal[PROPERTY_VALUE_MAX] = {0};
++        if (property_get("persist.camera.hal.exif_orientation", propVal, "") > 0) {
++            int v = atoi(propVal);
++            if (v == 1 || v == 3 || v == 6 || v == 8) {
++                size_t offset = static_cast<size_t>(index) * mem->mBufSize;
++                if (offset + mem->mBufSize <= mem->mBufSize * mem->mNumBufs) {
++                    void* jpeg = static_cast<uint8_t*>(mem->mHidlHeapMemData) + offset;
++                    bool ok = patchJpegExifOrientation(jpeg, mem->mBufSize,
++                            static_cast<uint16_t>(v));
++                    ALOGI("sDataCb: EXIF Orientation patch -> %d (%s)",
++                            v, ok ? "applied" : "skipped");
++                }
++            }
++        }
++    }
++
+     if (index >= mem->mNumBufs) {
+         ALOGE("%s: invalid buffer index %d, max allowed is %d", __FUNCTION__,
+              index, mem->mNumBufs);
+@@ -535,7 +647,10 @@ void CameraDevice::handleCallbackTimestamp(
+ void CameraDevice::sDataCbTimestamp(nsecs_t timestamp, int32_t msg_type,
+         const camera_memory_t *data, unsigned index, void *user) {
+     ALOGV("%s", __FUNCTION__);
+-    CameraDevice* object = static_cast<CameraDevice*>(user);
++    // N-era MTK HAL ABI: user may be NULL (see sCameraInstance declaration in header).
++    CameraDevice* object = (user != nullptr)
++            ? static_cast<CameraDevice*>(user)
++            : sCameraInstance;
+     // Start refcounting the heap object from here on.  When the clients
+     // drop all references, it will be destroyed (as well as the enclosed
+     // MemoryHeapBase.
+@@ -719,6 +834,10 @@ Return<Status> CameraDevice::open(const sp<ICameraDeviceCallback>& callback) {
+     }
+ #endif
+ 
++    // Set static instance fallback before registering callbacks so that N-era MTK HAL
++    // calls to get_memory/notify/data with user=NULL can recover 'this'.
++    sCameraInstance = this;
++
+     if (mDevice->ops->set_callbacks) {
+         mDevice->ops->set_callbacks(mDevice,
+                 sNotifyCb, sDataCb, sDataCbTimestamp, sGetMemory, this);
+@@ -1013,6 +1132,34 @@ Return<Status> CameraDevice::setParameters(const hidl_string& params) {
+     return Status::ILLEGAL_ARGUMENT;
+ }
+ 
++// Reduce a comma-separated list of "WxH" dimensions to a single
++// largest-by-area entry. Used to filter `picture-size-values` and
++// `preview-size-values` so that any client picking the first or default
++// advertised size lands on the sensor-native max instead of a downscaled
++// or letterboxed sub-mode.
++static std::string filterToLargestSize(const std::string& sizes) {
++    long bestArea = 0;
++    std::string best;
++    size_t i = 0;
++    while (i < sizes.size()) {
++        size_t comma = sizes.find(',', i);
++        std::string tok = sizes.substr(i, comma == std::string::npos
++                ? std::string::npos : comma - i);
++        size_t x = tok.find('x');
++        if (x != std::string::npos) {
++            long w = strtol(tok.substr(0, x).c_str(), nullptr, 10);
++            long h = strtol(tok.substr(x + 1).c_str(), nullptr, 10);
++            if (w > 0 && h > 0 && w * h > bestArea) {
++                bestArea = w * h;
++                best = tok;
++            }
++        }
++        if (comma == std::string::npos) break;
++        i = comma + 1;
++    }
++    return best;
++}
++
+ Return<void> CameraDevice::getParameters(getParameters_cb _hidl_cb) {
+     ALOGV("%s(%s)", __FUNCTION__, mCameraId.c_str());
+     Mutex::Autolock _l(mLock);
+@@ -1024,12 +1171,45 @@ Return<void> CameraDevice::getParameters(getParameters_cb _hidl_cb) {
+     }
+     if (mDevice->ops->get_parameters) {
+         char *temp = mDevice->ops->get_parameters(mDevice);
+-        outStr = temp;
++        std::string params(temp ? temp : "");
+         if (mDevice->ops->put_parameters) {
+             mDevice->ops->put_parameters(mDevice, temp);
+         } else {
+             free(temp);
+         }
++
++        // checkers OV9734: blob advertises sub-native modes (320x240, 640x480,
++        // 1024x768) alongside the sensor-native 1280x720 in
++        // picture-size-values. Camera2 / Camera2-API LEGACY clients pick
++        // either the largest 4:3 entry (1024x768) or the first entry as the
++        // default, leaving captures stuck below sensor-native unless the user
++        // overrides per-app. The sysprop replaces both size lists with the
++        // single largest-by-area entry so any client lands on the native max.
++        char propVal[PROPERTY_VALUE_MAX] = {0};
++        if (property_get("persist.camera.hal.supported_sizes_filter",
++                propVal, "") > 0 && strcmp(propVal, "native_only") == 0) {
++            // Pull current values, reduce to largest, write back.
++            for (const char* key : {"picture-size-values",
++                                    "preview-size-values"}) {
++                std::string needle(key);
++                needle += "=";
++                size_t k = params.find(needle);
++                if (k == std::string::npos) continue;
++                if (k != 0 && params[k - 1] != ';') continue;
++                size_t v = k + needle.size();
++                size_t end = params.find(';', v);
++                if (end == std::string::npos) end = params.size();
++                std::string original = params.substr(v, end - v);
++                std::string filtered = filterToLargestSize(original);
++                if (!filtered.empty() && filtered != original) {
++                    params.replace(v, end - v, filtered);
++                    ALOGI("getParameters: %s filtered '%s' -> '%s'",
++                            key, original.c_str(), filtered.c_str());
++                }
++            }
++        }
++
++        outStr = params;
+     }
+     _hidl_cb(outStr);
+     return Void();
+@@ -1056,6 +1236,7 @@ Return<void> CameraDevice::close() {
+ 
+ void CameraDevice::closeLocked() {
+     ALOGI("Closing camera %s", mCameraId.c_str());
++    sCameraInstance = nullptr;
+     if(mDevice) {
+         int rc = mDevice->common.close(&mDevice->common);
+         if (rc != OK) {
+diff --git a/camera/device/1.0/default/CameraDevice_1_0.h b/camera/device/1.0/default/CameraDevice_1_0.h
+index 2b35a730db..27e3bc4e34 100644
+--- a/camera/device/1.0/default/CameraDevice_1_0.h
++++ b/camera/device/1.0/default/CameraDevice_1_0.h
+@@ -166,6 +166,13 @@ private:
+     bool  mDisconnected;
+ 
+     static HandleImporter sHandleImporter;
++    // Fallback for N-era MTK HAL ABI: libcam.client.so invokes get_memory / notify /
++    // data / data_timestamp callbacks with user=NULL, ignoring the context registered
++    // via set_callbacks(). The HIDL bridge needs the CameraDevice instance to forward
++    // callbacks and register HIDL memory, so cache 'this' in a static set during open()
++    // and cleared in closeLocked(). Single-instance: this device tree exposes only one
++    // camera HAL1 module, so the static can never be racing two open()s.
++    static CameraDevice* sCameraInstance;
+ 
+     const SortedVector<std::pair<std::string, std::string>>& mCameraDeviceNames;
+ 
+diff --git a/camera/device/3.2/default/CameraDevice.cpp b/camera/device/3.2/default/CameraDevice.cpp
+index 4f85b58cf9..60f59d2b75 100644
+--- a/camera/device/3.2/default/CameraDevice.cpp
++++ b/camera/device/3.2/default/CameraDevice.cpp
+@@ -243,6 +243,14 @@ Return<void> CameraDevice::open(const sp<ICameraDeviceCallback>& callback,
+             return Void();
+         }
+ 
++        // Zero register_stream_buffers: the N-era HAL populates this slot but
++        // Android 11 cameraserver requires it to be NULL per
++        // CAMERA_DEVICE_API_VERSION_3_2+ spec. Zero it post-open pre-createSession
++        // so cameraserver's ops table validation passes.
++        if (device->ops != nullptr) {
++            device->ops->register_stream_buffers = nullptr;
++        }
++
+         session = createSession(
+                 device, info.static_camera_characteristics, callback);
+         if (session == nullptr) {

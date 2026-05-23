@@ -1,0 +1,90 @@
+diff --git a/services/camera/libcameraservice/device1/CameraHardwareInterface.cpp b/services/camera/libcameraservice/device1/CameraHardwareInterface.cpp
+index 61cada6..9a32fd4 100644
+--- a/services/camera/libcameraservice/device1/CameraHardwareInterface.cpp
++++ b/services/camera/libcameraservice/device1/CameraHardwareInterface.cpp
+@@ -17,6 +17,8 @@
+ //#define LOG_NDEBUG 0
+ 
+ #include <inttypes.h>
++#include <stdlib.h>
++#include <cutils/properties.h>
+ #include <media/hardware/HardwareAPI.h> // For VideoNativeHandleMetadata
+ #include "CameraHardwareInterface.h"
+ 
+@@ -59,6 +61,52 @@ status_t CameraHardwareInterface::setPreviewScalingMode(int scalingMode)
+ 
+ status_t CameraHardwareInterface::setPreviewTransform(int transform) {
+     int rc = OK;
++
++    // Allow a device-tree-set sysprop to override the framework-computed
++    // preview transform. Some devices set ro.surface_flinger.primary_display_orientation
++    // to compensate for non-natural panel orientation; this is invisible to
++    // WindowManager and breaks the standard Camera1 orientation->transform
++    // composition. The sysprop allows the device tree to pin the correct
++    // NATIVE_WINDOW_SET_BUFFERS_TRANSFORM value (0-7). No-op when unset.
++    //
++    // The correct sysprop value depends on the consumer of the preview
++    // BufferQueue. SurfaceTexture+GL consumers (e.g. AOSP Camera2 app)
++    // composite the buffer in the app process before SurfaceFlinger sees it;
++    // raw SurfaceView consumers (e.g. Open Camera) hand the buffer directly
++    // to SurfaceFlinger, which composes it with the display-orientation
++    // override. The two paths require different transforms.
++    //
++    // Distinguish the consumer by the framework-computed transform value.
++    // Camera1's CameraClient front-camera mirror flag composes with the
++    // app's setDisplayOrientation request:
++    //   - GL consumer (no setDisplayOrientation): first call carries
++    //     NATIVE_WINDOW_TRANSFORM_FLIP_H (=1).
++    //   - Raw consumer (setDisplayOrientation(90)): first call carries
++    //     NATIVE_WINDOW_TRANSFORM_ROT_90|FLIP_H (=5).
++    // Latch the hint from the first call; subsequent calls inherit it.
++    if (mPreviewConsumerHint == 0) {
++        if (transform == 5) {
++            mPreviewConsumerHint = 1;
++            ALOGI("%s: latched raw-consumer hint (framework=5)", __FUNCTION__);
++        }
++    }
++
++    const char* propName = (mPreviewConsumerHint == 1)
++            ? "persist.camera.preview_transform_raw"
++            : "persist.camera.preview_transform";
++    char prop[PROPERTY_VALUE_MAX] = "";
++    property_get(propName, prop, "");
++    if (prop[0] != '\0') {
++        char* end = nullptr;
++        long override_val = strtol(prop, &end, 10);
++        if (end != prop && *end == '\0' &&
++                override_val >= 0 && override_val <= 7) {
++            ALOGI("%s: framework=%d override=%ld (%s)", __FUNCTION__,
++                    transform, override_val, propName);
++            transform = static_cast<int>(override_val);
++        }
++    }
++
+     mPreviewTransform = transform;
+     if (mPreviewWindow != nullptr) {
+         rc = native_window_set_buffers_transform(mPreviewWindow.get(),
+diff --git a/services/camera/libcameraservice/device1/CameraHardwareInterface.h b/services/camera/libcameraservice/device1/CameraHardwareInterface.h
+index 4a20b6a..c66b1f0 100644
+--- a/services/camera/libcameraservice/device1/CameraHardwareInterface.h
++++ b/services/camera/libcameraservice/device1/CameraHardwareInterface.h
+@@ -101,6 +101,7 @@ public:
+             mName(name),
+             mPreviewScalingMode(NOT_SET),
+             mPreviewTransform(NOT_SET),
++            mPreviewConsumerHint(0),
+             mPreviewWidth(NOT_SET),
+             mPreviewHeight(NOT_SET),
+             mPreviewFormat(NOT_SET),
+@@ -445,6 +446,11 @@ private:
+     static const int NOT_SET = -1;
+     int mPreviewScalingMode;
+     int mPreviewTransform;
++    // Consumer-type hint latched from the first setPreviewTransform call.
++    // 0 = unknown / SurfaceTexture+GL (Camera1 client without
++    // setDisplayOrientation); 1 = raw SurfaceView (Camera1 client that
++    // called setDisplayOrientation).
++    int mPreviewConsumerHint;
+     int mPreviewWidth;
+     int mPreviewHeight;
+     int mPreviewFormat;

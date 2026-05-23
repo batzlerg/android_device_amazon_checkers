@@ -1,0 +1,18 @@
+diff --git a/media/java/android/media/CameraProfile.java b/media/java/android/media/CameraProfile.java
+index 905e2d2d..803b1162 100644
+--- a/media/java/android/media/CameraProfile.java
++++ b/media/java/android/media/CameraProfile.java
+@@ -63,6 +63,13 @@ public class CameraProfile
+                 return getJpegEncodingQualityParameter(i, quality);
+             }
+         }
++        // No back-facing camera. Fall back to the first available camera
++        // so callers on front-only devices get a usable quality value
++        // instead of a 0 that would feed Bitmap.compress(JPEG, 0, ...)
++        // and produce an unusable image.
++        if (numberOfCameras > 0) {
++            return getJpegEncodingQualityParameter(0, quality);
++        }
+         return 0;
+     }
+ 

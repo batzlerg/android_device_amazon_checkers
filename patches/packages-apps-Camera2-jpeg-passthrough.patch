@@ -1,0 +1,63 @@
+diff --git a/src/com/android/camera/processing/imagebackend/TaskCompressImageToJpeg.java b/src/com/android/camera/processing/imagebackend/TaskCompressImageToJpeg.java
+index 7a2caf9..58f69be 100644
+--- a/src/com/android/camera/processing/imagebackend/TaskCompressImageToJpeg.java
++++ b/src/com/android/camera/processing/imagebackend/TaskCompressImageToJpeg.java
+@@ -179,6 +179,18 @@ public class TaskCompressImageToJpeg extends TaskJpegEncode {
+                     final DeviceOrientation combinedRotationFromSensorToJpeg =
+                             addOrientation(img.rotation, exifDerivedRotation);
+ 
++                    // When the JPEG carries a non-trivial EXIF Orientation
++                    // tag, its pixel data is sensor-native and the rotation
++                    // is metadata applied at display time. Rotating a
++                    // sensor-coordinate crop into JPEG-native space in that
++                    // case would double-rotate, clipping a full-frame
++                    // landscape sensor crop to a square. Apply the crop
++                    // directly when the JPEG is sensor-aligned.
++                    final DeviceOrientation cropRotation =
++                            (exifDerivedRotation == DeviceOrientation.CLOCKWISE_0)
++                                    ? combinedRotationFromSensorToJpeg
++                                    : DeviceOrientation.CLOCKWISE_0;
++
+                     if (exifPixelXDimension == null || exifPixelYDimension == null) {
+                         Log.w(TAG,
+                                 "Cannot parse EXIF for image dimensions, passing 0x0 dimensions");
+@@ -186,13 +198,13 @@ public class TaskCompressImageToJpeg extends TaskJpegEncode {
+                         imageWidth = 0;
+                         // calculate crop from exif info with image proxy width/height
+                         safeCrop = guaranteedSafeCrop(img.proxy,
+-                                rotateBoundingBox(img.crop, combinedRotationFromSensorToJpeg));
++                                rotateBoundingBox(img.crop, cropRotation));
+                     } else {
+                         imageWidth = exifPixelXDimension;
+                         imageHeight = exifPixelYDimension;
+                         // calculate crop from exif info with combined rotation
+                         safeCrop = guaranteedSafeCrop(imageWidth, imageHeight,
+-                                rotateBoundingBox(img.crop, combinedRotationFromSensorToJpeg));
++                                rotateBoundingBox(img.crop, cropRotation));
+                     }
+ 
+                     // Ignore the device rotation on ImageToProcess and use the EXIF from
+@@ -203,7 +215,22 @@ public class TaskCompressImageToJpeg extends TaskJpegEncode {
+                             imageHeight,
+                             img.proxy.getFormat(), safeCrop);
+ 
+-                    if(requiresCropOperation(img.proxy, safeCrop)) {
++                    // requiresCropOperation queries img.proxy.getWidth() /
++                    // getHeight(); for a BLOB ImageReader those are 1D buffer
++                    // dimensions (byte count and 1), not pixel coordinates,
++                    // so the test always reports a crop is required for any
++                    // non-empty rect. Treat a safeCrop that already covers
++                    // the full EXIF-declared image as a pass-through to
++                    // avoid an unnecessary decompress / recompress that
++                    // would also rewrite EXIF.
++                    final boolean cropCoversFullImage = imageWidth > 0
++                            && imageHeight > 0
++                            && safeCrop.left == 0 && safeCrop.top == 0
++                            && safeCrop.width() == imageWidth
++                            && safeCrop.height() == imageHeight;
++
++                    if (!cropCoversFullImage
++                            && requiresCropOperation(img.proxy, safeCrop)) {
+                         // Crop the image
+                         resultImage = new TaskImage(
+                                 exifDerivedRotation,
