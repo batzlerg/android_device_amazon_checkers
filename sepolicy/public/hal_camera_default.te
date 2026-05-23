@@ -1,23 +1,52 @@
-#============= hal_camera_default ==============
-# 2017/9/16: daniel_hk(danielhk@github.com)
-allow hal_camera_default CAM_CAL_DRV_device:chr_file { open read write };
-allow hal_camera_default camera_isp_device:chr_file { ioctl open read write };
-allow hal_camera_default devmap_device:chr_file { open read ioctl };
-allow hal_camera_default hal_camera_default:capability { sys_nice };
-allow hal_camera_default kd_camera_flashlight_device:chr_file { ioctl open read write };
+# hal_camera_default.te -- MTK camera HAL allow rules for checkers (Echo Show 5 Gen 1 / MT8163)
+#
+# Extends the generic hal_camera_default domain (defined in system/sepolicy) which already grants:
+#   - binder IPC to/from hal_camera_client/server (via hal_server_domain macro)
+#   - generic camera_device, ion_device, video_device rw access
+#   - hal_camera_hwservice registration
+#   - graphics allocator fd use
+#
+# This file adds MTK-specific character devices and capabilities NOT covered by generic policy.
+# Rules derived from karnak (mt8163/android_device_amazon_karnak_old @ e123e756c96f766c02dc82f000a33611f9cfc240)
+# with additions from sepolicy_survey.yaml (2026-04-18) for coverage gaps.
+
+#============= hal_camera_default -- MTK sensor kernel driver =============
 allow hal_camera_default kd_camera_hw_device:chr_file { ioctl open read write };
-allow hal_camera_default proc:file { ioctl open read write };
+allow hal_camera_default kd_camera_hw_bus2_device:chr_file { ioctl open read write };
+allow hal_camera_default kd_camera_flashlight_device:chr_file { ioctl open read write };
+
+#============= hal_camera_default -- MTK ISP and pipeline devices =============
+allow hal_camera_default camera_isp_device:chr_file { ioctl open read write };
+allow hal_camera_default camera_pipemgr_device:chr_file { read open ioctl };
+allow hal_camera_default camera_sysram_device:chr_file { read write open ioctl };
+allow hal_camera_default camera_fdvt_device:chr_file { read write open ioctl };
+
+#============= hal_camera_default -- MTK system devices =============
+allow hal_camera_default mtk_cmdq_device:chr_file rw_file_perms;
+allow hal_camera_default MTK_SMI_device:chr_file rw_file_perms;
+allow hal_camera_default devmap_device:chr_file { open read ioctl };
+
+#============= hal_camera_default -- EEPROM calibration =============
+allow hal_camera_default CAM_CAL_DRV_device:chr_file { open read write };
+
+#============= hal_camera_default -- NVRAM (calibration and sensor config) =============
 allow hal_camera_default nvram_device:blk_file { open read write };
 allow hal_camera_default nvram_data_file:file { getattr open read };
-allow hal_camera_default sysfs:file { open read };
-allow hal_camera_default vndbinder_device:chr_file { ioctl };
+allow hal_camera_default nvram_data_file:dir { search read write add_name };
+allow hal_camera_default nvram_prop:file { open read getattr };
+
+#============= hal_camera_default -- vendor binder and service lookup =============
+allow hal_camera_default vndbinder_device:chr_file { ioctl open read write };
 allow hal_camera_default vndservicemanager:binder { call };
 allow hal_camera_default hal_graphics_mapper_hwservice:hwservice_manager { find };
-allow hal_camera_default nvram_prop:file { open read getattr };
-allow hal_camera_default kmsg_device:chr_file { open read write };
-allow hal_camera_default nvram_data_file:dir search;
-allow hal_camera_default kmsg_device:chr_file getattr;
-allow hal_camera_default nvram_data_file:dir write;
-allow hal_camera_default nvram_data_file:dir read;
 
+#============= hal_camera_default -- capabilities and kernel =============
+allow hal_camera_default hal_camera_default:capability { sys_nice };
+allow hal_camera_default kernel:system { module_request };
 
+#============= hal_camera_default -- filesystem reads =============
+allow hal_camera_default sysfs:file { open read };
+allow hal_camera_default proc:file { ioctl open read write };
+
+#============= hal_camera_default -- logging =============
+allow hal_camera_default kmsg_device:chr_file { open read write getattr };
