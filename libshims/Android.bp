@@ -1,0 +1,167 @@
+// Android.bp -- camera shim libraries for Echo Show 5 Gen 1 (checkers / MT8163)
+//
+// These shims bridge N-era (Android N / API 25) symbol forms expected by
+// stock MTK camera blobs to the A11 forms present in LineageOS 18.1 system libs.
+//
+// Both libraries are ARM-32 only (checkers is 32-bit userspace), vendor-scoped,
+// and compiled with -fno-rtti -fno-exceptions to match the stock blob ABI.
+//
+
+
+// -----------------------------------------------------------------------
+// libui_n_era_shim -- GraphicBuffer 2-arg lock + 7-arg ctor + GBMapper 4-arg lock
+// -----------------------------------------------------------------------
+// Provides N-era android::GraphicBuffer and android::GraphicBufferMapper symbols
+// that libcam_utils.so imports but that are absent from A11 libui.so (where
+// GraphicBuffer::lock gained outBytesPerPixel/outBytesPerStride args and the
+// ctor gained a layerCount arg).
+//
+// DT_NEEDED added to libcam_utils.so via blob_fixup() in extract-files.sh.
+// DT_NEEDED to libui.so is implicit (libui symbols are in the calling blob's
+// existing NEEDED chain; this shim's A11 targets resolve via the runtime linker).
+cc_library_shared {
+    name: "libui_n_era_shim",
+    vendor: true,
+    compile_multilib: "32",
+
+    srcs: ["libui_n_era_shim.cpp"],
+
+    shared_libs: ["libui"],
+
+    cflags: [
+        "-O2",
+        "-fno-rtti",
+        "-fno-exceptions",
+        "-Wno-unused-parameter",
+    ],
+
+    // No init_rc, no apex_available -- pure shim lib.
+}
+
+// -----------------------------------------------------------------------
+// libdpframework_n_era_shim -- DpIspStream + DpBlitStream N-era method forms
+// -----------------------------------------------------------------------
+// Provides N-era DpIspStream::{setSrcConfig,setDstConfig,startStream} and
+// DpBlitStream::invalidate symbols that 5 stock camera blobs import but that
+// are absent from A11 libdpframework.so (where DpSecure was added as a param
+// to setSrcConfig/setDstConfig, and timeval* was added to startStream/invalidate).
+//
+// Forwards to A11 forms with safe defaults:
+//   setSrcConfig/setDstConfig: DpSecure=0 (DP_SECURE_NONE -- non-secure)
+//   startStream/invalidate: timeval = gettimeofday() + 30s
+//
+// DT_NEEDED to libdpframework.so is built in via shared_libs (equivalent to
+// the NDK-build patchelf --add-needed post-step; Soong handles it at link time).
+// DT_NEEDED to the shim is added to the 5 importing blobs via blob_fixup()
+// in extract-files.sh.
+// Prebuilt stub for libdpframework.so (proprietary vendor blob).
+// Declares the module so cc_library_shared can list it in shared_libs.
+// The real binary is not available in the build tree (it lives in vendor/lib/
+// on-device); this stub declaration satisfies Soong's module resolver while
+// ALLOW_MISSING_DEPENDENCIES=true is set for the camera HAL build.
+cc_prebuilt_library_shared {
+    name: "libdpframework",
+    vendor: true,
+    compile_multilib: "32",
+    prefer: true,
+    check_elf_files: false,
+    strip: {
+        none: true,
+    },
+    srcs: ["libdpframework_stub.so"],
+}
+
+cc_library_shared {
+    name: "libdpframework_n_era_shim",
+    vendor: true,
+    compile_multilib: "32",
+
+    srcs: ["libdpframework_n_era_shim.cpp"],
+
+    // libdpframework.so is a proprietary vendor blob. We declare it above as a
+    // cc_prebuilt_library_shared stub so Soong can resolve it in shared_libs.
+    // At link time, Soong produces the correct DT_NEEDED entry in the shim so the
+    // dynamic linker loads the real on-device /vendor/lib/libdpframework.so at
+    // runtime and resolves the A11 symbol forms the shim forwards to.
+    shared_libs: ["libdpframework"],
+
+    cflags: [
+        "-O2",
+        "-fno-rtti",
+        "-fno-exceptions",
+        "-Wno-unused-parameter",
+    ],
+
+    // No init_rc, no apex_available -- pure shim lib.
+}
+
+// -----------------------------------------------------------------------
+// libdpframework_compat -- DpIspStream shadow-allocation ABI compat shim
+// -----------------------------------------------------------------------
+// Shadow-allocation shim that solves the ABI struct-size
+// drift where N-era caller blobs allocate DpIspStream at 0x5a8 bytes
+// but the A11 ctor writes fields up to ~0x46f8 (~18 KB), overrunning
+// the caller's allocation and SIGSEGV-ing inside libdpframework.so.
+//
+// The shim exports every DpIspStream symbol the 5 caller blobs use
+// (ctor, dtor, 15 methods = 17 total). The ctor:
+//   1. Receives the caller's 0x5a8-byte facade pointer as `this`.
+//   2. Allocates a separate 0x4800-byte A11-sized buffer.
+//   3. Invokes the REAL A11 ctor (dlsym'd from libdpframework.so) on
+//      the A11-sized buffer.
+//   4. Records facade->real in a shadow map (std::unordered_map+std::mutex).
+// Every method thunk looks up the real pointer and delegates.
+// Dtor invokes the real dtor, frees the A11 buffer, erases the map entry.
+//
+// Three DpIspStream methods have N-era<->A11 signature drift (setSrcConfig,
+// setDstConfig, startStream) -- the compat shim subsumes these from
+// libdpframework_n_era_shim and does shadow-remap + signature-adapt
+// in one step.
+//
+// DpBlitStream gets the same shadow-alloc + field-sync treatment: the
+// 1.34x drift (N-era 0x130 -> A11 0x198) is NOT tail-padding-safe -- a plain dlsym
+// forwarder let the A11 ctor write +0x134..+0x197 into the caller's stack slot,
+// clobbering saved lr/fp (SIGSEGV at dtor). Compat shadow-allocates the A11-sized
+// object and syncs the inline-accessed fields at +0x8c/+0x90.
+// Compat now exports 11 DpBlitStream symbols (10 non-drifted + 1
+// signature-drifted `invalidate()`). This lets the DpBlitStream callers
+// (libcam.camshot.so, libfeatureio.so, libcam.camadapter.so) point to compat,
+// eliminating real libdpframework.so from HAL DT_NEEDED chains entirely.
+//
+// DT_NEEDED ordering in each caller blob (via blob_fixup() in extract-files.sh):
+//   [compat, n_era_shim, ...existing...]   (compat wins GOT resolution)
+//
+// Uses -static-libstdc++ to avoid a libc++ DT_NEEDED on the shim
+// (std::unordered_map / std::mutex implementation is baked in).
+cc_library_shared {
+    name: "libdpframework_compat",
+    vendor: true,
+    compile_multilib: "32",
+
+    srcs: [
+        "libdpframework_compat/DpIspStreamCompat.cpp",
+        "libdpframework_compat/DpBlitStreamCompat.cpp",
+    ],
+
+    // Real libdpframework.so is NOT declared as a shared_lib here -- we
+    // resolve the A11 symbols via dlopen("libdpframework.so", RTLD_NOW)
+    // and dlsym at runtime. This avoids Soong needing to see the real
+    // A11 symbol surface at build time (which isn't available in the
+    // tree -- libdpframework is a prebuilt proprietary blob).
+    shared_libs: [
+        "libdl",   // dlopen / dlsym
+    ],
+
+    // Link libc++ statically so the shim doesn't drag a libc++.so
+    // DT_NEEDED into the caller processes. The shim uses
+    // std::unordered_map and std::mutex; these compile-time utilities
+    // are bundled into the shim .so.
+    stl: "libc++_static",
+
+    cflags: [
+        "-O2",
+        "-fno-rtti",
+        "-fno-exceptions",
+        "-Wno-unused-parameter",
+    ],
+}
