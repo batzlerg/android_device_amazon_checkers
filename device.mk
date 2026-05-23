@@ -9,6 +9,25 @@ $(call inherit-product, frameworks/native/build/tablet-7in-hdpi-1024-dalvik-heap
 PRODUCT_AAPT_CONFIG := normal
 PRODUCT_AAPT_PREF_CONFIG := hdpi
 
+# Camera HAL -- camerahalserver (AOSP 8.1 legacy HIDL wrapper for stock MTK camera.mt8163.so)
+# Bridges N-era MediaTek camera HAL to Android 11 android.hardware.camera.provider@2.4 HIDL.
+PRODUCT_PACKAGES += \
+    camerahalserver \
+    android.hardware.camera.provider@2.4-impl-checkers
+
+# Camera shims -- N-era -> A11 symbol bridge libraries
+# libui_n_era_shim:         GraphicBuffer::lock 2-arg, 7-arg ctor, GraphicBufferMapper::lock 4-arg
+# libdpframework_n_era_shim: DpIspStream setSrcConfig/setDstConfig/startStream + DpBlitStream::invalidate
+# libdpframework_compat:    DpIspStream shadow-alloc ABI compat; fixes 0x5a8->0x4800 struct-size
+#                           drift in the five N-era caller blobs. Subsumes n_era_shim's DpIspStream
+#                           handling; n_era_shim is still needed for DpBlitStream::invalidate.
+# All added to importing blobs via blob_fixup() in extract-files.sh.
+PRODUCT_PACKAGES += \
+    libui_n_era_shim \
+    libdpframework_n_era_shim \
+    libdpframework_compat
+
+
 # Audio
 PRODUCT_PACKAGES += \
     android.hardware.audio@2.0-impl \

@@ -18,4 +18,12 @@
         <transport>hwbinder</transport>
         <fqname>@1.0::IBluetoothHci/default</fqname>
     </hal>
+    <!-- Camera provider: legacy/0 required by A11 CameraProviderManager.
+         HAL1 devices register as device@1.0/legacy/N; provider must use the "legacy" prefix
+         so the framework accepts device registrations. -->
+    <hal format="hidl">
+        <name>android.hardware.camera.provider</name>
+        <transport>hwbinder</transport>
+        <fqname>@2.4::ICameraProvider/legacy/0</fqname>
+    </hal>
 </manifest>
