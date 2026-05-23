@@ -6,7 +6,91 @@ ro.audiohal.has_get_capture_position=true
 persist.bluetooth.enablenewavrcp=false
 
 # Display
+# Panel reports natively as 480x960 portrait via HWC, but the chassis
+# mounts it sideways so the user sees a 960x480 landscape canvas. Two
+# independent layers need to agree on this: the framework (WindowManager
+# and downstream layout) and the compositor (SurfaceFlinger -> physical
+# panel mapping).
+#
+# Framework layer: WindowManagerService.applyForcedPropertiesForDefaultDisplay()
+# reads ro.config.size_override at boot and calls
+# DisplayContent.updateBaseDisplayMetrics(960, 480, density).
+# DisplayRotation.configure() then takes its width>height branch, seeding
+# mLandscapeRotation=ROTATION_0 and mPortraitRotation=ROTATION_270 - the
+# framework's natural-orientation anchors match the chassis. Nav-bar
+# position, activity bounds, and per-app screenOrientation routing all
+# derive consistently from this single root.
+ro.config.size_override=960,480
+
+# Compositor layer: SurfaceFlinger needs an explicit rotation hint to
+# bridge the 960x480 framework canvas onto the 480x960 physical panel.
+# Without it, SF treats the producer-side framebuffer as the same shape
+# as the panel surface and falls back to a centered uniform-scale fit -
+# the framebuffer ends up letterboxed into a 480x240 strip in the
+# middle of the panel, surrounded by black. ro.config.size_override
+# does NOT cover this mapping; ro.config.size_override stops at the WindowManager layer.
+# This sysprop instructs SurfaceFlinger to rotate the physical panel
+# projection so the compositor's 960x480 output maps 1:1 onto the
+# 480x960 panel hardware.
 ro.surface_flinger.primary_display_orientation=ORIENTATION_90
+
+# Camera
+# The front-facing sensor is mounted at a fixed offset relative to the
+# panel; the panel itself sits inside a landscape chassis. Activity
+# layouts on Android 11 use the built-in forced-base-dimensions
+# mechanism (ro.config.size_override / Settings.Global.DISPLAY_SIZE_FORCED
+# = "960,480") so apps lay out for chassis-landscape. Pixel rotation
+# inside the preview buffer is governed by the
+# sysprop-gated override in libcameraservice that pins the final
+# NATIVE_WINDOW_SET_BUFFERS_TRANSFORM value (0-7) on the BufferQueue.
+#
+# Two override sysprops exist because the Camera1 preview-transform
+# consumer-type latch (in libcameraservice) routes differently per consumer:
+# preview_transform routes the SurfaceTexture+GL consumer path (AOSP
+# Camera2) and preview_transform_raw routes the raw SurfaceView path
+# (Open Camera). Empirically the two paths require different override
+# values under the same framework and display-rotation configuration.
+#
+# preview_transform = 4 (NATIVE_WINDOW_TRANSFORM_ROT_90) is the value
+# that produces a chassis-correct AOSP Camera2 preview (TOP-at-top,
+# BOTTOM-at-bottom, square-is-square,
+# frame-fills, with the intended front-camera horizontal mirror).
+# Empirical sweep evidence: 4-value sweep against the validation scene,
+# screencaps verified against validation scene on the target device.
+# Capture path (JPEG-encode in cameraservice with EXIF Orientation)
+# is independent of this sysprop; all four sweep captures verified
+# qualitatively correct after EXIF rotation.
+#
+# preview_transform_raw retains its initial value of 2.
+# Open Camera's portrait SurfaceView shape is set by the app's own
+# view-layout code reading Display.getRotation() in a phone-centric
+# way; no value of preview_transform_raw can resize the SurfaceView
+# (sysprop composes onto an already-set surface -- it cannot reshape it).
+# Open Camera is therefore not addressable from this knob under this
+# device's display configuration.
+persist.camera.preview_transform=4
+persist.camera.preview_transform_raw=2
+
+# EXIF Orientation byte-patch: the vendor HAL (libcam.camshot.so) always
+# emits EXIF Orientation=1 regardless of Camera.Parameters("rotation"),
+# so the captured JPEG is rotated 180 deg from device-natural when
+# displayed by a gallery. The HAL bridge sDataCb walks JPEG markers,
+# locates IFD0 tag 0x0112, and overwrites the inline SHORT value with
+# this sysprop. Value 3 (bottom-right / 180 deg) is what the sensor
+# mounting requires for an upright display. Unset = no rewrite = wrong
+# on-disk orientation.
+persist.camera.hal.exif_orientation=3
+
+# Size-list filter: the blob advertises sub-native modes (320x240,
+# 640x480, 1024x768) alongside the sensor-native 1280x720 in
+# picture-size-values and preview-size-values. Camera2 / Camera2-API
+# LEGACY clients pick 1024x768 (largest 4:3 entry) as the default,
+# leaving captures below native resolution. Setting this sysprop to
+# "native_only" replaces both size lists in getParameters with the
+# single largest-by-area entry (1280x720) so any client that picks the
+# first or default size lands on the sensor-native maximum. Unset = full
+# advertised list = Camera2 defaults to sub-native 1024x768.
+persist.camera.hal.supported_sizes_filter=native_only
 
 # Bluetooth
 ro.vendor.rfkilldisabled=1
