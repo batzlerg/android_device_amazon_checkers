@@ -14,17 +14,56 @@
  * limitations under the License.
  */
 
+/*
+ * camerahalserver -- forked from AOSP 8.1 hardware/interfaces/camera/provider/2.4/default/
+ * at tag android-8.1.0_r81.  Adaptations for checkers (Amazon Echo Show 5 Gen 1, MT8163):
+ *
+ *  1. The service entry point (main() + four RTLD_GLOBAL preloads that must precede
+ *     camera.mt8163.so loading) lives in camerahalserver_main.cpp, not here -- this file is
+ *     stripped of AOSP's main().  HIDL_FETCH_ICameraProvider (below) is retained as the HIDL
+ *     passthrough entry point.  The preloads are needed because the stock N-era MTK blobs have
+ *     implicit symbol dependencies not expressed via DT_NEEDED; without RTLD_GLOBAL the linker
+ *     cannot resolve them.  Order is load-bearing; validated empirically.
+ *
+ *  2. register_stream_buffers defensive NULL patch: after hw_module methods->open() returns
+ *     a camera3_device_t, we zero device->ops->register_stream_buffers before any further
+ *     ops use.  The concrete ICamDevice implementations in the stock MTK BSP are N-era; the
+ *     Android 11 camera framework requires this slot to be NULL per CAMERA_DEVICE_API_VERSION_3_2+
+ *     spec.  The ops table lives in an external ICamDevice implementation library loaded at
+ *     runtime; defensive zeroing is safe and spec-compliant.
+ *
+ *  3. A11 HIDL API surface adaptation: libhidltransport is merged into libhidlbase in Android
+ *     11; the Android.bp lists both names but only libhidlbase is needed at link time on A11.
+ *     defaultPassthroughServiceImplementation and ProcessState APIs are stable across 8.1->11.
+ *
+ *  4. Provider instance name is "legacy/0" (AOSP 8.1/A11 default). Android 11
+ *     CameraProviderManager requires the instance name to match the device-type prefix
+ *     ("legacy") for HAL1 devices enumerated as device@1.0/legacy/N.
+ *     The on-device VINTF manifest must declare "legacy/0" to match.
+ */
+
 #define LOG_TAG "CamProvider@2.4-impl"
 //#define LOG_NDEBUG 0
 #include <android/log.h>
 
 #include "CameraProvider.h"
-#include "CameraDevice_1_0.h"
-#include "CameraDevice_3_3.h"
-#include <cutils/properties.h>
+// Device impl headers -- these type declarations are provided by local source compilation
+// (CameraDevice.cpp, CameraDeviceSession.cpp) or by linking camera.device@{1.0,3.2,3.3}-impl.
+// Using local header copies ensures the class layout matches our patched CameraDevice.cpp.
+#include "CameraDevice_3_2.h"    // V3_2 CameraDevice (our local patched copy)
+#include "CameraDevice_1_0.h"    // V1_0 CameraDevice (from A11 header_lib)
+#include "CameraDevice_3_3.h"    // V3_3 CameraDevice (from A11 header_lib)
 #include <string.h>
-#include <utils/Trace.h>
 
+// HIDL / hardware headers for the provider impl library
+#include <android/hardware/camera/provider/2.4/ICameraProvider.h>
+
+// For hw_module_t and camera3_device_t
+#include <hardware/hardware.h>
+#include <hardware/camera3.h>
+
+#include <cutils/properties.h>
+#include <utils/Trace.h>
 
 namespace android {
 namespace hardware {
@@ -496,6 +535,9 @@ Return<void> CameraProvider::getCameraDeviceInterface_V3_x(
                 _hidl_cb(Status::INTERNAL_ERROR, nullptr);
                 return Void();
             }
+            // NOTE: register_stream_buffers defensive NULL patch is applied in CameraDevice.cpp
+            // at the CameraDevice::open() site, immediately after mModule->open() succeeds
+            // and before createSession() is called.  See CameraDevice.cpp for the 2-line patch.
             device = deviceImpl;
             break;
         }
@@ -510,6 +552,7 @@ Return<void> CameraProvider::getCameraDeviceInterface_V3_x(
                 _hidl_cb(Status::INTERNAL_ERROR, nullptr);
                 return Void();
             }
+            // NOTE: see CameraDevice.cpp for the register_stream_buffers NULL patch.
             device = deviceImpl;
             break;
         }
@@ -523,7 +566,9 @@ Return<void> CameraProvider::getCameraDeviceInterface_V3_x(
     return Void();
 }
 
-ICameraProvider* HIDL_FETCH_ICameraProvider(const char* name) {
+// HIDL_FETCH_ICameraProvider is the passthrough entry point called by the HIDL framework
+// when the service binary calls defaultPassthroughServiceImplementation.
+extern "C" ICameraProvider* HIDL_FETCH_ICameraProvider(const char* name) {
     if (strcmp(name, kLegacyProviderName) != 0) {
         return nullptr;
     }
@@ -546,3 +591,7 @@ ICameraProvider* HIDL_FETCH_ICameraProvider(const char* name) {
 }  // namespace camera
 }  // namespace hardware
 }  // namespace android
+
+// main() is in camerahalserver_main.cpp (the cc_binary source).
+// CameraProvider.cpp is compiled into android.hardware.camera.provider@2.4-impl-checkers.so
+// (the passthrough impl library loaded by the service binary via defaultPassthroughServiceImplementation).

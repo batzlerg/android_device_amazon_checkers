@@ -1,0 +1,145 @@
+// Android.bp for camerahalserver -- Echo Show 5 Gen 1 (checkers / MT8163) camera HAL wrapper
+//
+// Architecture:
+//   cc_library_shared  android.hardware.camera.provider@2.4-impl-checkers
+//     -- passthrough impl library loaded by defaultPassthroughServiceImplementation.
+//     -- contains the forked AOSP 8.1 CameraProvider.cpp (stripped of main()).
+//     -- links against the camera.device@3.2-impl / @3.3-impl / @1.0-impl shared libs
+//       for the device-level implementation; does not compile device sources locally.
+//   cc_binary          camerahalserver
+//     -- thin service binary: RTLD_GLOBAL preloads + ProcessState + passthrough registration.
+//     -- does not link the impl: defaultPassthroughServiceImplementation dlopen()s
+//       android.hardware.camera.provider@2.4-impl-checkers.so at runtime via the HIDL
+//       passthrough loader. Links only the A11 HIDL provider interface lib + foundation libs.
+//
+// CameraProvider.cpp is forked from AOSP 8.1 android-8.1.0_r81
+// hardware/interfaces/camera/provider/2.4/default/ with the following adaptations:
+// - main() stripped (binary entry point is camerahalserver_main.cpp).
+// - Provider instance name changed to "legacy/0" (required by A11 CameraProviderManager
+//   to accept HAL1 device registrations; "internal/0" causes EINVAL on device register).
+// - register_stream_buffers zeroed after open() per CAMERA_DEVICE_API_VERSION_3_2+ requirement.
+
+// -----------------------------------------------------------------------
+// Passthrough impl library (loaded via dlopen by HIDL framework)
+// -----------------------------------------------------------------------
+cc_library_shared {
+    name: "android.hardware.camera.provider@2.4-impl-checkers",
+    defaults: ["hidl_defaults"],
+    proprietary: true,
+    relative_install_path: "hw",
+
+    // The 3.2/3.3/1.0 CameraDevice implementations are not compiled here -- they come
+    // from the camera.device@*-impl shared libraries this module links against.
+    // A local copy duplicated CameraDeviceSession::sHandleImporter across two DSOs
+    // in one process and caused a double pthread_mutex_destroy (FORTIFY abort) on
+    // shutdown.
+    srcs: [
+        "CameraProvider.cpp",       // forked from AOSP 8.1, stripped of main()
+    ],
+
+    // Local include dir provides our forked headers (CameraDevice_3_2.h, CameraDeviceSession.h,
+    // CameraProvider.h, convert.h).
+    local_include_dirs: ["."],
+
+    // Absolute include paths for device impl headers that camera.device@3.x-impl shared libs
+    // export via export_include_dirs but which cannot be referenced as header_libs (those
+    // modules only have a link:shared variant, not a header variant).
+    // These provide CameraDevice_1_0.h (V1.0 device), CameraDevice_3_2.h, CameraDeviceSession.h,
+    // CameraDevice_3_3.h (V3.3 device), and convert.h.
+    include_dirs: [
+        "hardware/interfaces/camera/device/1.0/default",
+        "hardware/interfaces/camera/device/3.2/default",
+        "hardware/interfaces/camera/device/3.3/default",
+        // common@1.0 helper headers (CameraModule.h, VendorTagDescriptor.h, etc.)
+        "hardware/interfaces/camera/common/1.0/default/include",
+    ],
+
+    shared_libs: [
+        // A11 HIDL base
+        "libhidlbase",
+        // Foundation libs
+        "libbase",
+        "liblog",
+        "libutils",
+        "libcutils",
+        "libhardware",
+        // Camera HIDL interfaces
+        "android.hardware.camera.common@1.0",
+        "android.hardware.camera.provider@2.4",
+        "android.hardware.camera.device@1.0",
+        "android.hardware.camera.device@3.2",
+        "android.hardware.camera.device@3.3",
+        // Camera device impl shared libs -- V3.2 (patched, built from AOSP tree with
+        // register_stream_buffers=nullptr fix), V3.3, and V1.0.
+        // Using shared libs (not static link + forked sources) prevents duplicate
+        // CameraDeviceSession::sHandleImporter statics across DSOs in the same process.
+        "camera.device@3.2-impl",
+        "camera.device@3.3-impl",
+        "camera.device@1.0-impl",
+        // Camera metadata
+        "libcamera_metadata",
+        // Graphics (for HandleImporter in CameraDeviceSession, via camera.device@3.2-impl)
+        "android.hardware.graphics.mapper@2.0",
+        "android.hardware.graphics.mapper@3.0",
+        "android.hardware.graphics.mapper@4.0",
+        "android.hidl.allocator@1.0",
+        "android.hidl.memory@1.0",
+        // gralloc4 helpers
+        "libgralloctypes",
+        // FMQ (for request/result queue in CameraDeviceSession)
+        "libfmq",
+    ],
+
+    // No static_libs: common@1.0-helper symbols resolve from camera.device@3.2-impl.so (shared
+    // lib above); static-linking the same archive here would duplicate sHandleImporter and
+    // reproduce the FORTIFY abort.
+
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-parameter",  // AOSP 8.1 sources have some unused params
+        "-Wno-unused-variable",
+        "-fexceptions",           // used by AOSP 8.1 regex/string code
+    ],
+}
+
+// -----------------------------------------------------------------------
+// Service binary
+// -----------------------------------------------------------------------
+cc_binary {
+    name: "camerahalserver",
+    // No hidl_defaults -- that brings in libhidltransport which is not visible in A11.
+    // All required HIDL deps are listed explicitly below.
+    proprietary: true,
+    relative_install_path: "hw",
+    compile_multilib: "32",         // checkers is 32-bit userspace (armv7a)
+
+    srcs: ["camerahalserver_main.cpp"],
+
+    init_rc: ["camerahalserver.rc"],
+
+    shared_libs: [
+        // HIDL support for defaultPassthroughServiceImplementation
+        // libhidltransport is merged into libhidlbase in A11; do not list
+        "libhidlbase",
+        // Binder (vndbinder init)
+        "libbinder",
+        // Logging
+        "liblog",
+        "libutils",
+        // Camera HIDL provider interface (for ICameraProvider template type)
+        "android.hardware.camera.provider@2.4",
+        // dl for preload calls
+        "libdl",
+        // Note: android.hardware.camera.provider@2.4-impl-checkers is NOT listed here.
+        // defaultPassthroughServiceImplementation dlopen()s the impl lib at runtime via the
+        // HIDL passthrough loader; no link-time dependency from the service binary to the impl
+        // is needed.  The impl lib is installed separately by PRODUCT_PACKAGES.
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-parameter",
+    ],
+}

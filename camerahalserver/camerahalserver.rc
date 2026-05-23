@@ -1,0 +1,7 @@
+service vendor.camera-provider-2-4 /vendor/bin/hw/camerahalserver
+    class hal
+    user cameraserver
+    group audio camera drmrpc input media media_rw system graphics sdcard_rw
+    capabilities SYS_NICE
+    ioprio rt 4
+    task_profiles CameraServiceCapacity MaxPerformance
